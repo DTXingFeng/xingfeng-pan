@@ -1,0 +1,29 @@
+# 构建产物
+pan
+pan.exe
+*.exe
+*.out
+
+# Go 本地构建缓存
+.gocache/
+.gomodcache/
+
+# 运行时数据（数据库 / 日志 / 缩略图缓存，在可执行文件旁自动生成）
+data/
+
+# 本地配置（含密码，首次运行自动生成，参考 config.example.yaml）
+config.yaml
+
+# 本地测试挂载目录
+test_files/
+
+# 回收站
+.trash/
+
+# 前端依赖（frontend/dist 是嵌式资源，需要提交，勿忽略）
+node_modules/
+
+# 日志与系统杂项
+*.log
+.DS_Store
+Thumbs.db

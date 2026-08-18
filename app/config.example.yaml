@@ -1,0 +1,19 @@
+# 刑风网盘配置示例
+# 复制到可执行文件同目录并重命名为 config.yaml（首次运行也会自动生成默认配置）
+
+# HTTP 服务端口
+port: 8080
+
+# 挂载目录：网盘文件的实际存储位置（Windows 路径用正斜杠或双反斜杠）
+mount_path: E:/files
+
+# WebDAV 账号（网页端账号密码在管理面板中设置）
+webdav_user: admin
+# 建议改为强密码；也支持 bcrypt 哈希（$2a$/$2b$/$2y$ 开头）或 b64: 前缀编码
+webdav_pass: "请修改为强密码"
+
+# ffmpeg 路径：视频缩略图与转码依赖，留默认 "ffmpeg" 表示使用 PATH 中的 ffmpeg
+ffmpeg_path: ffmpeg
+
+# API 直连令牌（留空表示不启用，仅内网使用时可留空）
+auth_token: ""
