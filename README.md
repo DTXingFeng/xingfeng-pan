@@ -1,6 +1,9 @@
-# 刑风网盘
+# 刑风网盘 XingFeng Pan
 
-单二进制内网网盘。Go + Vue 3 + SQLite，无 CGO 依赖，编译一次扔到服务器即可运行。
+> 单二进制内网网盘 · 自建私有云盘 · 局域网文件服务器
+> Single-binary self-hosted cloud storage & file server for your LAN.
+
+Go + Vue 3 + SQLite，无 CGO 依赖，编译一次扔到服务器即可运行。适合家用 NAS、家庭服务器或公司内网的自建网盘方案：下载一个可执行文件，指向硬盘目录，即得完整的网页端网盘 + WebDAV 挂载。
 
 ## 功能
 
