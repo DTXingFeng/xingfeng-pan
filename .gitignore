@@ -4,6 +4,9 @@ pan.exe
 *.exe
 *.out
 
+# Release 打包目录
+release/
+
 # Go 本地构建缓存
 .gocache/
 .gomodcache/
