@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -98,6 +99,7 @@ func InitAPI() http.Handler {
 	api.HandleFunc("/download", handleDownload).Methods("GET", "OPTIONS")
 	api.HandleFunc("/download/zip", handleZipDownload).Methods("GET", "OPTIONS")
 	api.HandleFunc("/stream", handleStream).Methods("GET", "OPTIONS")
+	api.HandleFunc("/probe", handleProbe).Methods("GET", "OPTIONS")
 	api.HandleFunc("/transcode", handleTranscode).Methods("GET", "OPTIONS")
 	api.HandleFunc("/upload", handleUpload).Methods("POST", "OPTIONS")
 	api.HandleFunc("/upload/chunk", handleUploadChunkInit).Methods("POST", "OPTIONS")
@@ -119,6 +121,7 @@ func InitAPI() http.Handler {
 	api.HandleFunc("/file/info", handleFileInfo).Methods("GET", "OPTIONS")
 	api.HandleFunc("/file/regen-thumb", handleRegenThumbnail).Methods("POST", "OPTIONS")
 	api.HandleFunc("/video/repair", handleVideoRepair).Methods("POST", "OPTIONS")
+	api.HandleFunc("/local-play-token", handleLocalPlayToken).Methods("GET", "OPTIONS")
 	api.HandleFunc("/admin/dashboard", handleAdminDashboard).Methods("GET", "OPTIONS")
 	api.HandleFunc("/admin/thumb/failed", handleAdminThumbFailed).Methods("GET", "OPTIONS")
 	api.HandleFunc("/admin/thumb/retry-all", handleAdminThumbRetryAll).Methods("POST", "OPTIONS")
@@ -416,8 +419,133 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	serveFileRange(w, r, rec.FullPath)
 }
 
-// handleTranscode 实时转封装/转码视频为 mp4 流（用于浏览器不支持的容器格式）
-// GET /api/transcode?uuid=xxx&mode=copy|transcode
+// handleLocalPlayToken 返回认证令牌，供前端拼装外部播放器（PotPlayer 等）直链
+// 需通过认证才能访问；未启用认证时返回空字符串
+// GET /api/local-play-token
+func handleLocalPlayToken(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]string{"token": AppConfig.AuthToken})
+}
+
+// tailBuffer 只保留末尾内容的日志缓冲（用于截取 ffmpeg 错误信息）
+type tailBuffer struct {
+	buf []byte
+}
+
+const tailLimit = 8 * 1024
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > tailLimit {
+		t.buf = t.buf[len(t.buf)-tailLimit:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	return string(t.buf)
+}
+
+// ffprobeExe 查找 ffprobe：优先取 ffmpeg 同目录，其次 PATH；找不到返回空
+func ffprobeExe() string {
+	if AppConfig.FFmpegPath == "" {
+		return ""
+	}
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	// 若 ffmpeg_path 是命令名（如 "ffmpeg"），Dir 为 "."，Join 后仍是命令名，LookPath 会搜索 PATH
+	cand := filepath.Join(filepath.Dir(AppConfig.FFmpegPath), "ffprobe"+suffix)
+	if p, err := exec.LookPath(cand); err == nil {
+		return p
+	}
+	if p, err := exec.LookPath("ffprobe" + suffix); err == nil {
+		return p
+	}
+	return ""
+}
+
+// handleProbe 探测媒体编码信息，前端据此选择直连/转封装/转码播放策略
+// GET /api/probe?uuid=xxx
+func handleProbe(w http.ResponseWriter, r *http.Request) {
+	uuidStr := r.URL.Query().Get("uuid")
+	if uuidStr == "" {
+		respondError(w, http.StatusBadRequest, "缺少 uuid 参数")
+		return
+	}
+
+	rec, err := GetFileByUUID(uuidStr)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "文件不存在")
+		return
+	}
+
+	if _, err := os.Stat(rec.FullPath); os.IsNotExist(err) {
+		respondError(w, http.StatusNotFound, "文件已被删除")
+		return
+	}
+
+	probeExe := ffprobeExe()
+	if probeExe == "" {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"available": false})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, probeExe,
+		"-v", "quiet",
+		"-print_format", "json",
+		"-show_entries", "stream=index,codec_type,codec_name,codec_tag_string:format=duration",
+		rec.FullPath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		// 探测失败不阻断播放，前端将退回按扩展名判断
+		respondJSON(w, http.StatusOK, map[string]interface{}{"available": false})
+		return
+	}
+
+	var probeRes struct {
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+			CodecTag  string `json:"codec_tag_string"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.Unmarshal(out, &probeRes); err != nil {
+		respondJSON(w, http.StatusOK, map[string]interface{}{"available": false})
+		return
+	}
+
+	videoCodec, videoTag, audioCodec := "", "", ""
+	for _, s := range probeRes.Streams {
+		if s.CodecType == "video" && videoCodec == "" {
+			videoCodec = s.CodecName
+			videoTag = s.CodecTag
+		} else if s.CodecType == "audio" && audioCodec == "" {
+			audioCodec = s.CodecName
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"available":   true,
+		"video_codec": videoCodec,
+		"video_tag":   videoTag,
+		"audio_codec": audioCodec,
+		"duration":    probeRes.Format.Duration,
+	})
+}
+
+// handleTranscode 实时转封装/转码视频为 fMP4 流（用于浏览器不支持的容器/编码格式）
+// GET /api/transcode?uuid=xxx&mode=copy|audio|transcode
+//   copy      仅转封装：容器不兼容但编码兼容（如 mkv 内的 H.264+AAC），CPU 开销极低
+//   audio     视频直拷 + 音频转 AAC：视频编码兼容但音轨不兼容（如 H.264 + AC3/DTS）
+//   transcode 完全转码：视频转 H.264 + 音频转 AAC（如 HEVC 片源，CPU 开销最高）
 func handleTranscode(w http.ResponseWriter, r *http.Request) {
 	uuidStr := r.URL.Query().Get("uuid")
 	if uuidStr == "" {
@@ -448,35 +576,42 @@ func handleTranscode(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[转码] %s (%s) 模式: %s", rec.Name, rec.Ext, mode)
 
-	// 构建 ffmpeg 命令：输入文件 → fragmented MP4 输出到 stdout
-	var args []string
-	if mode == "transcode" {
-		// 完全转码模式：视频转 H.264，音频转 AAC
-		args = []string{
-			"-i", rec.FullPath,
-			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-			"-c:a", "aac", "-b:a", "128k",
-			"-movflags", "frag_mp4+empty_moov+default_base_moof",
-			"-f", "mp4",
-			"-threads", "2",
-			"pipe:1",
+	// 统一只保留第一路视频流和第一路音频流，丢弃字幕/附件/封面图等，
+	// 避免字幕流（ASS/PGS）或附件（mkv 内封封面）导致 MP4 封装失败
+	streamArgs := []string{"-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn"}
+
+	var codecArgs []string
+	switch mode {
+	case "audio":
+		codecArgs = []string{"-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2"}
+	case "transcode":
+		codecArgs = []string{
+			"-c:v", "libx264", "-preset", "ultrafast", "-crf", "27", "-pix_fmt", "yuv420p",
+			"-c:a", "aac", "-b:a", "192k", "-ac", "2",
 		}
-	} else {
-		// copy 模式：只转封装，不重新编码（CPU 开销极低）
-		args = []string{
-			"-i", rec.FullPath,
-			"-c", "copy",
-			"-movflags", "frag_mp4+empty_moov+default_base_moof",
-			"-f", "mp4",
-			"pipe:1",
-		}
+	default:
+		// copy 模式：只转封装，不重新编码
+		mode = "copy"
+		codecArgs = []string{"-c", "copy"}
 	}
+
+	args := append([]string{"-nostdin", "-nostats", "-loglevel", "error", "-i", rec.FullPath}, streamArgs...)
+	args = append(args, codecArgs...)
+	args = append(args,
+		// empty_moov+frag_keyframe+default_base_moof：moov 前置 + 关键帧分片，
+		// 浏览器可边下边播。注：旧写法 frag_mp4 在 FFmpeg 8+ 已移除，此处用全版本兼容组合
+		"-movflags", "empty_moov+frag_keyframe+default_base_moof",
+		"-f", "mp4",
+		"-threads", "2",
+		"pipe:1",
+	)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Hour)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, AppConfig.FFmpegPath, args...)
-	cmd.Stderr = nil // 忽略 ffmpeg 日志输出
+	var errBuf tailBuffer
+	cmd.Stderr = &errBuf
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -491,24 +626,55 @@ func handleTranscode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 先等第一段输出：若 ffmpeg 立即失败（损坏文件/无法识别的流），
+	// 在写 200 响应头之前返回 500，前端能拿到明确错误并逐级降级
+	buf := make([]byte, 64*1024) // 64KB 缓冲
+	firstN, _ := stdout.Read(buf)
+	if firstN == 0 {
+		waitErr := cmd.Wait()
+		reason := strings.TrimSpace(errBuf.String())
+		if reason == "" && waitErr != nil {
+			reason = waitErr.Error()
+		}
+		log.Printf("[转码] ffmpeg 无输出即退出: %s 模式 %s: %s", rec.Name, mode, reason)
+		msg := reason
+		if len(msg) > 300 {
+			msg = msg[len(msg)-300:]
+		}
+		respondError(w, http.StatusInternalServerError, "ffmpeg 处理失败: "+msg)
+		return
+	}
+
 	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
 
 	// 流式传输 ffmpeg 输出到 HTTP 响应
-	buf := make([]byte, 64*1024) // 64KB 缓冲
+	total := int64(0)
 	flusher, canFlush := w.(http.Flusher)
+	writeChunk := func(p []byte) bool {
+		if _, writeErr := w.Write(p); writeErr != nil {
+			log.Printf("[转码] 写入中断（客户端断开）: %v", writeErr)
+			cmd.Process.Kill()
+			return false
+		}
+		total += int64(len(p))
+		if canFlush {
+			flusher.Flush()
+		}
+		return true
+	}
+
+	if !writeChunk(buf[:firstN]) {
+		cmd.Wait()
+		return
+	}
+
 	for {
 		n, readErr := stdout.Read(buf)
 		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				log.Printf("[转码] 写入中断（客户端断开）: %v", writeErr)
-				cmd.Process.Kill()
+			if !writeChunk(buf[:n]) {
 				break
-			}
-			if canFlush {
-				flusher.Flush()
 			}
 		}
 		if readErr != nil {
@@ -517,7 +683,7 @@ func handleTranscode(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd.Wait()
-	log.Printf("[转码] 完成: %s", rec.Name)
+	log.Printf("[转码] 完成: %s 模式 %s, 输出 %s", rec.Name, mode, formatFileSize(total))
 }
 
 // handleUpload 文件上传接口（流式处理，不经过 ParseMultipartForm 临时文件）

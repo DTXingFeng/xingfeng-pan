@@ -226,6 +226,11 @@ func authMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
+		// 兜底从 URL 查询参数读取（PotPlayer/VLC 等外部播放器无法携带 cookie）
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+
 		if token == "" || token != AppConfig.AuthToken {
 			respondError(w, http.StatusUnauthorized, "未认证")
 			return

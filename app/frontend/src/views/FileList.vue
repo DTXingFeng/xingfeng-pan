@@ -381,9 +381,11 @@
         <div v-if="videoNeedsTranscode && !videoReady && !videoError" class="video-transcode-tip">
           <el-icon :size="40" color="#409EFF" class="transcode-spin"><Loading /></el-icon>
           <p style="margin: 12px 0 4px; font-size: 15px; color: #606266">
-            {{ videoTranscodeMode === 'transcode' ? '正在转码中，请稍候…' : '正在转封装中…' }}
+            {{ videoLoadingText }}
           </p>
-          <p style="margin: 0; font-size: 13px; color: #909399">视频格式需要服务端处理后才能播放</p>
+          <p style="margin: 0; font-size: 13px; color: #909399">
+            {{ videoCodecInfo || '视频格式需要服务端处理后才能播放' }}
+          </p>
         </div>
         <video
           v-if="videoDialogVisible && !videoError"
@@ -401,12 +403,24 @@
         <div v-if="videoError" class="video-error-tip">
           <el-icon :size="48" color="#909399"><VideoCamera /></el-icon>
           <p style="margin: 12px 0 4px; font-size: 15px; color: #606266">
-            {{ videoNeedsTranscode ? '视频转码失败，无法在线播放' : '该视频格式浏览器无法直接播放' }}
+            该视频无法在浏览器直接播放
           </p>
-          <p style="margin: 0 0 16px; font-size: 13px; color: #909399">请下载后使用本地播放器观看</p>
-          <el-button type="primary" @click="downloadCurrentVideo">
-            <el-icon style="margin-right: 4px"><Download /></el-icon>下载视频
-          </el-button>
+          <p style="margin: 0 0 16px; font-size: 13px; color: #909399">
+            {{ videoCodecInfo ? videoCodecInfo + '，' : '' }}编码不兼容或转码失败。可尝试强制转码、
+            复制直链用 PotPlayer/VLC 打开，或手机端继续用 WebDAV 播放器观看
+          </p>
+          <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap">
+            <el-button type="success" @click="openInPotPlayer(videoCurrentFile)">
+              用 PotPlayer 打开
+            </el-button>
+            <el-button v-if="videoMode !== 'transcode'" type="warning" @click="forceTranscodePlay">
+              强制转码播放
+            </el-button>
+            <el-button @click="copyVideoLink">复制直链</el-button>
+            <el-button type="primary" @click="downloadCurrentVideo">
+              <el-icon style="margin-right: 4px"><Download /></el-icon>下载视频
+            </el-button>
+          </div>
         </div>
         <div class="video-speed-bar" v-if="!videoError && (!videoNeedsTranscode || videoReady)">
           <span>倍速：</span>
@@ -421,8 +435,29 @@
             @click="toggleVolumeBalance"
             style="margin-left: 12px"
           >音量平衡{{ volumeBalance ? ' ✓' : '' }}</el-button>
+          <el-button size="small" @click="openInPotPlayer(videoCurrentFile)" style="margin-left: 12px">
+            PotPlayer 播放
+          </el-button>
           <el-button size="small" :icon="FullScreen" @click="toggleVideoFullscreen" style="margin-left: auto">全屏</el-button>
         </div>
+      </div>
+    </el-dialog>
+
+    <!-- PotPlayer 协议帮助 Dialog -->
+    <el-dialog v-model="potHelpVisible" title="使用 PotPlayer 打开" width="520px">
+      <div style="font-size: 14px; line-height: 1.9; color: #606266">
+        <p style="margin-top: 0">点击「PotPlayer 播放」会通过 <code>potplayer:/</code> 协议唤起本地 PotPlayer 直接播放原始视频流，<b>不经过服务器转码</b>，HEVC/AC3/DTS 等任何格式都能秒开，也不占用服务器 CPU。</p>
+        <p style="color: #e6a23c">看起来没有反应？说明这台电脑还没装协议支持，按下面两步配置一次即可：</p>
+        <el-form label-width="110px" label-position="left">
+          <el-form-item label="PotPlayer 路径">
+            <el-input v-model="potPathInput" placeholder="C:\Program Files\PotPlayer\PotPlayerMini64.exe" />
+          </el-form-item>
+        </el-form>
+        <el-button type="primary" @click="downloadPotReg">下载注册文件 (.reg)</el-button>
+        <p style="margin-bottom: 0; font-size: 13px; color: #909399">
+          1. 确认上面的路径与本机 PotPlayer 安装位置一致（可在 PotPlayer 安装目录找到 PotPlayerMini64.exe）<br>
+          2. 下载后双击导入注册表，回到网页再点一次「PotPlayer 播放」即可，浏览器首次会询问是否允许打开
+        </p>
       </div>
     </el-dialog>
 
@@ -570,6 +605,7 @@
       @click.stop
     >
       <div class="context-menu-item" @click="handleContextOpen">打开</div>
+      <div v-if="!contextFile?.is_dir && isVideo(contextFile?.ext)" class="context-menu-item" @click="handleContextPotPlayer">用 PotPlayer 播放</div>
       <div v-if="!contextFile?.is_dir" class="context-menu-item" @click="handleContextDownload">下载</div>
       <div v-if="contextFile?.is_dir" class="context-menu-item" @click="handleContextZipDownload">打包下载</div>
       <div class="context-menu-divider" />
@@ -666,9 +702,18 @@ const videoSrc = ref('')
 const videoSpeed = ref(1)
 const videoError = ref(false)
 const videoCurrentFile = ref(null)
-const videoNeedsTranscode = ref(false)
-const videoTranscodeMode = ref('')
+// 播放模式：pending 探测中 / direct 直连 / copy 转封装 / audio 转音轨 / transcode 实时转码
+const videoMode = ref('direct')
+const videoNeedsTranscode = computed(() => videoMode.value !== 'direct')
 const videoReady = ref(false)
+// 探测到的编码信息（用于界面提示）
+const videoCodecInfo = ref('')
+const videoLoadingText = computed(() => ({
+  pending: '正在检测视频编码…',
+  copy: '正在转封装中…',
+  audio: '音轨不兼容，正在转换音频…',
+  transcode: '正在实时转码（H.264）…首次缓冲可能较慢',
+}[videoMode.value] || '正在处理中…'))
 
 // 音量平衡
 const volumeBalance = ref(false)
@@ -1326,9 +1371,9 @@ function prepareNavigation(targetPath) {
     (target === '' || current.startsWith(target + '/'))
 
   if (isDescendant) {
-    // 进入子目录：保存当前滚动位置
+    // 进入子目录：保存当前滚动位置与页码
     navDirection = 'forward'
-    scrollPositionStack.push({ path: current, scrollTop: getScrollTop() })
+    scrollPositionStack.push({ path: current, scrollTop: getScrollTop(), page: currentPage.value })
   } else if (isAncestor) {
     // 返回上级目录：计算需要 pop 的层级数
     navDirection = 'back'
@@ -1349,11 +1394,24 @@ function navigateTo(path) {
   if (isSearching.value) clearSearch()
   prepareNavigation(path)
   saveRecentVisit(path)
-  if (!path) {
-    router.push({ path: '/files' })
-  } else {
-    router.push({ path: '/files', query: { path } })
+  const target = path || ''
+  if (navDirection === 'reset' && target === (currentPath.value || '')) {
+    // 点击当前目录面包屑：刷新列表但保持页码（不走路由，避免重复导航被丢弃）
+    loadFiles(target, currentPage.value).then(() => {
+      nextTick(() => scrollToTop())
+    })
+    return
   }
+  const query = {}
+  if (target) query.path = target
+  if (navDirection === 'back') {
+    // 返回上级：恢复离开该目录时所在的页码
+    const saved = scrollPositionStack.length ? scrollPositionStack[scrollPositionStack.length - 1] : null
+    if (saved && saved.path === target && saved.page > 1) {
+      query.page = String(saved.page)
+    }
+  }
+  router.push({ path: '/files', query })
 }
 
 function saveRecentVisit(path) {
@@ -1411,6 +1469,30 @@ function goHome() {
 // 文件点击事件
 const nativeVideoExts = new Set(['mp4', 'webm', 'ogg', 'mov', 'm4v'])
 
+// —— 浏览器解码能力判断（配合 /api/probe 的编码探测结果）——
+let hevcPlayableCache = null
+function browserHEVC() {
+  if (hevcPlayableCache === null) {
+    try {
+      const v = document.createElement('video')
+      hevcPlayableCache = !!(v.canPlayType && v.canPlayType('video/mp4; codecs="hvc1.1.6.L93.B0"'))
+    } catch (_) {
+      hevcPlayableCache = false
+    }
+  }
+  return hevcPlayableCache
+}
+// 视频编码是否可由浏览器直接解码
+function VIDEO_OK(codec) {
+  if (['h264', 'vp8', 'vp9', 'av1', 'theora'].includes(codec)) return true
+  if (codec === 'hevc') return browserHEVC()
+  return false
+}
+// 音频编码在 mp4 容器内是否可由浏览器直接解码
+function AUDIO_OK(codec) {
+  return ['aac', 'mp3', 'flac', 'opus', 'vorbis'].includes(codec)
+}
+
 function setVideoSpeed(speed) {
   videoSpeed.value = speed
   const player = document.querySelector('.video-player')
@@ -1451,18 +1533,165 @@ function onVideoReady() {
 function onVideoDialogClose() {
   videoSrc.value = ''
   videoReady.value = false
+  videoMode.value = 'direct'
+  videoCodecInfo.value = ''
   cleanupVolumeBalance()
 }
 
 function onVideoError() {
-  if (videoNeedsTranscode.value && videoTranscodeMode.value === 'copy') {
-    // copy 模式失败，自动降级到 transcode 模式
-    videoTranscodeMode.value = 'transcode'
-    videoReady.value = false
-    videoSrc.value = `/api/transcode?uuid=${videoCurrentFile.value.uuid}&mode=transcode`
+  // 探测中或尚未设置源时忽略（如空 src 产生的伪错误）
+  if (videoMode.value === 'pending' || !videoSrc.value) return
+  // 逐级降级：direct → copy → audio → transcode → 报错
+  const ladder = { direct: 'copy', copy: 'audio', audio: 'transcode' }
+  const next = ladder[videoMode.value]
+  if (next && videoCurrentFile.value) {
+    applyVideoMode(next)
     return
   }
   videoError.value = true
+}
+
+// 按模式设置播放源
+function applyVideoMode(mode) {
+  videoMode.value = mode
+  videoReady.value = false
+  videoSrc.value = mode === 'direct'
+    ? `/api/stream?uuid=${videoCurrentFile.value.uuid}`
+    : `/api/transcode?uuid=${videoCurrentFile.value.uuid}&mode=${mode}`
+}
+
+// 打开视频：先用 ffprobe 探测编码选择播放策略，失败时靠降级链兜底
+async function openVideo(file) {
+  videoTitle.value = file.name
+  videoCurrentFile.value = file
+  videoError.value = false
+  videoReady.value = false
+  videoSpeed.value = 1
+  videoCodecInfo.value = ''
+  videoMode.value = 'pending'
+  videoSrc.value = ''
+  videoDialogVisible.value = true
+
+  const ext = (file.ext || '').toLowerCase()
+  const containerNative = nativeVideoExts.has(ext)
+  // 无探测结果时的保守默认：native 扩展名直连，其余转封装
+  let mode = containerNative ? 'direct' : 'copy'
+
+  try {
+    const resp = await http.get(`/api/probe?uuid=${file.uuid}`, { timeout: 8000 })
+    const info = resp.data && resp.data.data
+    if (info && info.available && info.video_codec) {
+      const v = info.video_codec
+      const a = info.audio_codec || ''
+      videoCodecInfo.value = `视频编码 ${v.toUpperCase()}${a ? ` · 音频 ${a.toUpperCase()}` : ''}`
+      const videoOK = VIDEO_OK(v)
+      const audioOK = AUDIO_OK(a)
+      if (containerNative && videoOK && audioOK) {
+        mode = 'direct'
+      } else if (videoOK && !audioOK) {
+        mode = 'audio'      // 视频可播、音轨不兼容：只转音频，CPU 开销极低
+      } else if (videoOK) {
+        mode = 'copy'       // 编码兼容、容器不兼容：仅转封装
+      } else {
+        mode = 'transcode'  // HEVC 等浏览器不支持的编码：实时转码
+      }
+    }
+  } catch (_) {
+    // 探测失败（无 ffprobe / 超时）：按扩展名默认策略，交给降级链兜底
+  }
+
+  // 弹窗已被关闭或已切到别的文件时，丢弃过期的探测结果
+  if (!videoDialogVisible.value || videoCurrentFile.value?.uuid !== file.uuid) return
+  applyVideoMode(mode)
+}
+
+function forceTranscodePlay() {
+  if (!videoCurrentFile.value) return
+  videoError.value = false
+  applyVideoMode('transcode')
+}
+
+// —— PotPlayer 本地播放（potplayer:/ 自定义协议，零服务器转码）——
+const potHelpVisible = ref(false)
+const potPathInput = ref('C:\\Program Files\\PotPlayer\\PotPlayerMini64.exe')
+let cachedPlayToken
+
+async function getPlayToken() {
+  if (cachedPlayToken !== undefined) return cachedPlayToken
+  try {
+    const resp = await http.get('/api/local-play-token')
+    cachedPlayToken = (resp.data && resp.data.data && resp.data.data.token) || ''
+  } catch (_) {
+    cachedPlayToken = ''
+  }
+  return cachedPlayToken
+}
+
+async function openInPotPlayer(file) {
+  if (!file) return
+  potHelpVisible.value = false
+  const token = await getPlayToken()
+  let url = window.location.origin + `/api/stream?uuid=${file.uuid}`
+  if (token) url += `&token=${encodeURIComponent(token)}`
+  // 通过失焦判断协议是否已注册：注册成功会唤起 PotPlayer 使页面失焦
+  let launched = false
+  const onBlur = () => { launched = true }
+  window.addEventListener('blur', onBlur)
+  window.location.href = 'potplayer:/' + url
+  setTimeout(() => {
+    window.removeEventListener('blur', onBlur)
+    if (!launched) potHelpVisible.value = true
+  }, 1600)
+}
+
+// 生成注册 potplayer:/ 协议的 .reg 文件（写入 HKCU，无需管理员）
+function downloadPotReg() {
+  const potPath = (potPathInput.value || '').trim() || 'C:\\Program Files\\PotPlayer\\PotPlayerMini64.exe'
+  const inner = `cmd /v:on /c set "u=%1" & set "u=!u:potplayer:/=!" & start "" "${potPath}" "!u!"`
+  const escaped = inner.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+  const lines = [
+    'Windows Registry Editor Version 5.00',
+    '',
+    '[HKEY_CURRENT_USER\\Software\\Classes\\potplayer]',
+    '@="URL:PotPlayer"',
+    '"URL Protocol"=""',
+    '',
+    '[HKEY_CURRENT_USER\\Software\\Classes\\potplayer\\shell\\open\\command]',
+    `@="${escaped}"`,
+    '',
+  ]
+  const text = lines.join('\r\n')
+  // .reg 标准编码为 UTF-16LE + BOM
+  const bytes = new Uint8Array(2 + text.length * 2)
+  bytes[0] = 0xFF
+  bytes[1] = 0xFE
+  const dv = new DataView(bytes.buffer)
+  for (let i = 0; i < text.length; i++) {
+    dv.setUint16(2 + i * 2, text.charCodeAt(i), true)
+  }
+  const blob = new Blob([bytes], { type: 'application/octet-stream' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = 'open-with-potplayer.reg'
+  a.click()
+  URL.revokeObjectURL(a.href)
+  ElMessage.success('已下载，双击导入注册表后重试')
+}
+
+async function copyVideoLink() {
+  if (!videoCurrentFile.value) return
+  const token = await getPlayToken()
+  let url = window.location.origin + `/api/stream?uuid=${videoCurrentFile.value.uuid}`
+  if (token) url += `&token=${encodeURIComponent(token)}`
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(() => {
+      ElMessage.success('直链已复制，可用 PotPlayer / VLC 等播放器打开')
+    }).catch(() => {
+      ElMessage.warning(url)
+    })
+  } else {
+    ElMessage.warning(url)
+  }
 }
 
 function downloadCurrentVideo() {
@@ -1633,19 +1862,7 @@ function handleClick(file) {
     imageViewerIndex.value = idx >= 0 ? idx : 0
     imageViewerVisible.value = true
   } else if (isVideo(file.ext)) {
-    const ext = (file.ext || '').toLowerCase()
-    const needsTranscode = !nativeVideoExts.has(ext)
-    videoTitle.value = file.name
-    videoNeedsTranscode.value = needsTranscode
-    videoTranscodeMode.value = needsTranscode ? 'copy' : ''
-    videoSrc.value = needsTranscode
-      ? `/api/transcode?uuid=${file.uuid}&mode=copy`
-      : `/api/stream?uuid=${file.uuid}`
-    videoSpeed.value = 1
-    videoError.value = false
-    videoReady.value = !needsTranscode
-    videoCurrentFile.value = file
-    videoDialogVisible.value = true
+    openVideo(file)
   } else if (isAudio(file.ext)) {
     audioTitle.value = file.name
     audioSrc.value = `/api/stream?uuid=${file.uuid}`
@@ -2031,6 +2248,12 @@ function handleContextDownload() {
   const file = contextFile.value
   hideContextMenu()
   if (file) triggerDownload(file)
+}
+
+function handleContextPotPlayer() {
+  const file = contextFile.value
+  hideContextMenu()
+  if (file) openInPotPlayer(file)
 }
 
 function handleContextDelete() {
