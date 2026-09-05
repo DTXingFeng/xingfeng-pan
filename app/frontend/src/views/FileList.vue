@@ -446,8 +446,8 @@
     <!-- PotPlayer 协议帮助 Dialog -->
     <el-dialog v-model="potHelpVisible" title="使用 PotPlayer 打开" width="520px">
       <div style="font-size: 14px; line-height: 1.9; color: #606266">
-        <p style="margin-top: 0">点击「PotPlayer 播放」会通过 <code>potplayer:/</code> 协议唤起本地 PotPlayer 直接播放原始视频流，<b>不经过服务器转码</b>，HEVC/AC3/DTS 等任何格式都能秒开，也不占用服务器 CPU。</p>
-        <p style="color: #e6a23c">看起来没有反应？说明这台电脑还没装协议支持，按下面两步配置一次即可：</p>
+        <p style="margin-top: 0">点击「PotPlayer 播放」会通过 <code>potplayer://</code> 协议唤起本地 PotPlayer 直接播放原始视频流，<b>不经过服务器转码</b>，HEVC/AC3/DTS 等任何格式都能秒开，也不占用服务器 CPU。</p>
+        <p style="color: #e6a23c">看起来没有反应？说明这台电脑还没装协议支持（PotPlayer 升级有时也会重置协议注册），按下面两步配置一次即可：</p>
         <el-form label-width="110px" label-position="left">
           <el-form-item label="PotPlayer 路径">
             <el-input v-model="potPathInput" placeholder="C:\Program Files\PotPlayer\PotPlayerMini64.exe" />
@@ -1611,7 +1611,7 @@ function forceTranscodePlay() {
   applyVideoMode('transcode')
 }
 
-// —— PotPlayer 本地播放（potplayer:/ 自定义协议，零服务器转码）——
+// —— PotPlayer 本地播放（potplayer:// 自定义协议，零服务器转码）——
 const potHelpVisible = ref(false)
 const potPathInput = ref('C:\\Program Files\\PotPlayer\\PotPlayerMini64.exe')
 let cachedPlayToken
@@ -1637,17 +1637,22 @@ async function openInPotPlayer(file) {
   let launched = false
   const onBlur = () => { launched = true }
   window.addEventListener('blur', onBlur)
-  window.location.href = 'potplayer:/' + url
+  // 标准双斜杠格式 potplayer://http://...，PotPlayer 原生协议处理器可直接解析；
+  // 旧版单斜杠 potplayer:/ 形式只有配合本站生成的 cmd 包装器才能用，
+  // PotPlayer 升级时安装器会用原生处理器覆盖注册表导致播放失败
+  window.location.href = 'potplayer://' + url
   setTimeout(() => {
     window.removeEventListener('blur', onBlur)
     if (!launched) potHelpVisible.value = true
   }, 1600)
 }
 
-// 生成注册 potplayer:/ 协议的 .reg 文件（写入 HKCU，无需管理员）
+// 生成注册 potplayer:// 协议的 .reg 文件（写入 HKCU，无需管理员）
+// 仅在 PotPlayer 未自带协议注册时兜底（如绿色版）；命令行直调方式与
+// PotPlayer 官方安装器写入的注册表一致，不会被格式解析问题卡住
 function downloadPotReg() {
   const potPath = (potPathInput.value || '').trim() || 'C:\\Program Files\\PotPlayer\\PotPlayerMini64.exe'
-  const inner = `cmd /v:on /c set "u=%1" & set "u=!u:potplayer:/=!" & start "" "${potPath}" "!u!"`
+  const inner = `"${potPath}" "%1"`
   const escaped = inner.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
   const lines = [
     'Windows Registry Editor Version 5.00',
