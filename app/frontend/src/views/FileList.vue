@@ -186,22 +186,31 @@
         <p>松开鼠标上传文件到当前目录</p>
       </div>
 
-    <!-- 上传进度悬浮通知 -->
+    <!-- 上传任务：完成记录保留到用户手动清除 -->
     <transition name="upload-slide">
-      <div v-if="uploadingFiles.length > 0" class="upload-toast">
+      <section v-if="uploadingFiles.length > 0" class="upload-toast" aria-label="上传任务">
         <div class="upload-toast-header">
-          <span>上传中 ({{ uploadingFiles.filter(f => f.status === 'success').length }}/{{ uploadingFiles.length }})</span>
-          <el-button text size="small" @click="uploadingFiles = []">关闭</el-button>
+          <div>
+            <span>上传任务</span>
+            <div class="upload-summary" aria-live="polite">{{ uploadSummary }}</div>
+          </div>
+          <el-button text size="small" :disabled="!finishedUploadCount" @click="clearCompletedUploads">
+            {{ activeUploadCount ? '清除已完成' : '关闭' }}
+          </el-button>
         </div>
         <div class="upload-toast-body">
-          <div v-for="uf in uploadingFiles" :key="uf.name" class="upload-toast-item">
-            <span class="upload-name">{{ uf.name }}</span>
-            <el-progress :percentage="uf.status === 'skipped' ? 100 : uf.progress" :status="uf.status === 'skipped' ? 'warning' : uf.status" :stroke-width="4" style="flex: 1" />
-            <span v-if="uf.status === 'skipped'" class="upload-skipped-tag">重复跳过</span>
-            <span v-if="uf.speed" class="upload-speed">{{ uf.speed }}</span>
+          <div v-for="uf in uploadingFiles" :key="uf.id" class="upload-toast-item">
+            <div class="upload-item-heading">
+              <span class="upload-name" :title="uf.name">{{ uf.name }}</span>
+              <span class="upload-status" :class="uf.status">{{ uploadStatusText(uf) }}</span>
+            </div>
+            <el-progress :percentage="uf.progress" :status="uf.status === 'skipped' ? 'warning' : uf.status" :stroke-width="5" />
+            <div v-if="uf.speed && !uf.status && uf.phase === 'uploading'" class="upload-speed">{{ uf.speed }}</div>
+            <div v-if="uf.renamedName" class="upload-detail" :title="uf.renamedName">保存为：{{ uf.renamedName }}</div>
+            <div v-if="uf.error" class="upload-error" :title="uf.error">{{ uf.error }}</div>
           </div>
         </div>
-      </div>
+      </section>
     </transition>
 
       <!-- 搜索结果提示 -->
@@ -685,6 +694,14 @@ const selectedFiles = ref(new Set())
 // 拖拽上传
 const isDragging = ref(false)
 const uploadingFiles = ref([])
+const activeUploadCount = computed(() => uploadingFiles.value.filter(f => !f.status).length)
+const finishedUploadCount = computed(() => uploadingFiles.value.length - activeUploadCount.value)
+const uploadSummary = computed(() => {
+  const total = uploadingFiles.value.length
+  if (activeUploadCount.value) return `${activeUploadCount.value} 个进行中 · ${finishedUploadCount.value}/${total} 已结束`
+  const failed = uploadingFiles.value.filter(f => f.status === 'exception').length
+  return failed ? `已结束 · ${failed}/${total} 个失败` : `${total} 个任务已完成`
+})
 
 // 文件选择
 const fileInputRef = ref(null)
@@ -1920,6 +1937,102 @@ function triggerDownload(file) {
 
 // === 上传功能 ===
 
+let nextUploadTaskId = 0
+
+function createUploadTask(name) {
+  // 回调必须修改响应式对象，否则进度变化不会触发页面刷新。
+  const task = reactive({
+    id: ++nextUploadTaskId,
+    name,
+    progress: 0,
+    status: '',
+    phase: 'queued',
+    speed: '',
+    error: '',
+    renamedName: '',
+  })
+  uploadingFiles.value.push(task)
+  return task
+}
+
+function clearCompletedUploads() {
+  uploadingFiles.value = uploadingFiles.value.filter(task => !task.status)
+}
+
+function uploadStatusText(task) {
+  if (task.status === 'success') return '上传成功'
+  if (task.status === 'skipped') return '重复跳过'
+  if (task.status === 'exception') return '上传失败'
+  if (task.phase === 'queued') return '等待上传'
+  if (task.phase === 'merging') return '正在合并文件'
+  if (task.phase === 'processing') return '服务器处理中'
+  return '上传中'
+}
+
+function updateUploadProgress(task, loaded, total, startedAt) {
+  if (task.status) return
+  if (total > 0) {
+    // 网络传输结束后仍需等待服务器保存/去重，成功响应后才显示 100%。
+    task.progress = Math.max(task.progress, Math.min(99, Math.round((loaded / total) * 100)))
+    task.phase = loaded >= total ? 'processing' : 'uploading'
+  }
+  const elapsed = (Date.now() - startedAt) / 1000
+  if (elapsed > 0.5) task.speed = formatSpeed(loaded / elapsed)
+}
+
+async function uploadSingleFile(file, dirPath, task) {
+  task.phase = 'uploading'
+  try {
+    let result
+    if (file.size > 2 * 1024 * 1024 * 1024) {
+      result = await uploadFileChunked(file, dirPath, task)
+    } else {
+      const formData = new FormData()
+      formData.append('files', file)
+      const startedAt = Date.now()
+      const response = await http.post('/api/upload', formData, {
+        params: { path: dirPath },
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 0,
+        onUploadProgress: event => updateUploadProgress(task, event.loaded, event.total || file.size, startedAt),
+      })
+      result = response.data.data?.[0]
+    }
+    task.progress = 100
+    task.status = result?.skipped ? 'skipped' : 'success'
+    if (result?.renamed) task.renamedName = result.name
+  } catch (error) {
+    task.status = 'exception'
+    task.error = error.response?.data?.message || error.message || '上传失败，请重新选择文件重试'
+  } finally {
+    task.speed = ''
+  }
+}
+
+async function runUploadQueue(entries) {
+  let nextIndex = 0
+  async function processNext() {
+    while (nextIndex < entries.length) {
+      const { file, dirPath, task } = entries[nextIndex++]
+      await uploadSingleFile(file, dirPath, task)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(2, entries.length) }, () => processNext()))
+}
+
+function reportUploadResults(tasks, label = '上传完成') {
+  const success = tasks.filter(task => task.status === 'success').length
+  const failed = tasks.filter(task => task.status === 'exception').length
+  const skipped = tasks.filter(task => task.status === 'skipped').length
+  const renamed = tasks.filter(task => task.renamedName)
+  const summary = `${label}：${success} 个成功${skipped ? `，${skipped} 个重复跳过` : ''}${failed ? `，${failed} 个失败` : ''}`
+  if (failed || skipped) ElMessage.warning(summary)
+  else ElMessage.success(summary)
+  if (renamed.length) {
+    ElMessage.info(`已重命名 ${renamed.length} 个文件：${renamed.map(task => `${task.name} → ${task.renamedName}`).join('、')}`)
+  }
+}
+
 function triggerFileInput() {
   fileInputRef.value?.click()
 }
@@ -1960,6 +2073,16 @@ function handleFolderSelect(e) {
 
 async function uploadFolderFiles(dirs, fileEntries) {
   const basePath = currentPath.value || ''
+  const entries = fileEntries.map(entry => {
+    const dir = entry.relativePath.includes('/')
+      ? entry.relativePath.substring(0, entry.relativePath.lastIndexOf('/'))
+      : ''
+    return {
+      file: entry.file,
+      dirPath: basePath ? basePath + '/' + dir : dir,
+      task: createUploadTask(entry.relativePath),
+    }
+  })
 
   // 先创建所有目录
   for (const dir of dirs) {
@@ -1970,58 +2093,9 @@ async function uploadFolderFiles(dirs, fileEntries) {
     }
   }
 
-  // 逐个上传文件
-  const CONCURRENT = 2
-  let queue = [...fileEntries]
-
-  async function processNext() {
-    while (queue.length > 0) {
-      const entry = queue.shift()
-      if (!entry) break
-
-      const dir = entry.relativePath.includes('/')
-        ? entry.relativePath.substring(0, entry.relativePath.lastIndexOf('/'))
-        : ''
-      const uf = { name: entry.relativePath, progress: 0, status: '', speed: '' }
-      uploadingFiles.value.push(uf)
-
-      try {
-        const formData = new FormData()
-        formData.append('files', entry.file)
-
-        const startTime = Date.now()
-        const resp = await http.post('/api/upload', formData, {
-          params: { path: basePath ? basePath + '/' + dir : dir },
-          headers: { 'Content-Type': 'multipart/form-data' },
-          timeout: 0,
-          onUploadProgress: (e) => {
-            if (e.total > 0) {
-              uf.progress = Math.round((e.loaded / e.total) * 100)
-              const elapsed = (Date.now() - startTime) / 1000
-              if (elapsed > 0.5) {
-                const speed = e.loaded / elapsed
-                uf.speed = formatSpeed(speed)
-              }
-            }
-          },
-        })
-        uf.progress = 100
-        uf.status = 'success'
-      } catch {
-        uf.status = 'exception'
-      }
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(CONCURRENT, fileEntries.length) }, () => processNext())
-  await Promise.all(workers)
-
-  ElMessage.success(`文件夹上传完成：${fileEntries.length} 个文件`)
-  setTimeout(() => {
-    uploadingFiles.value = uploadingFiles.value.filter(f => f.status === 'exception')
-    if (uploadingFiles.value.length === 0) uploadingFiles.value = []
-    loadFiles(currentPath.value)
-  }, 1500)
+  await runUploadQueue(entries)
+  reportUploadResults(entries.map(entry => entry.task), '文件夹上传完成')
+  await loadFiles(currentPath.value)
 }
 
 // 拖拽事件
@@ -2040,92 +2114,14 @@ function onDrop(e) {
 }
 
 async function uploadFiles(fileList) {
-  const skippedFiles = []
-  const renamedFiles = []
-  const CONCURRENT = 2
-  let queue = [...fileList]
-
-  async function processNext() {
-    while (queue.length > 0) {
-      const file = queue.shift()
-      if (!file) break
-
-      const uf = { name: file.name, progress: 0, status: '', speed: '' }
-      uploadingFiles.value.push(uf)
-
-      try {
-        if (file.size > 2 * 1024 * 1024 * 1024) {
-          const resp = await uploadFileChunked(file, currentPath.value || '', uf)
-          if (resp?.skipped) {
-            skippedFiles.push(file.name)
-            uf.status = 'skipped'
-            continue
-          }
-          if (resp?.renamed) {
-            renamedFiles.push({ from: file.name, to: resp.name })
-          }
-          uf.progress = 100
-          uf.status = 'success'
-        } else {
-          const formData = new FormData()
-          formData.append('files', file)
-
-          const uploadStartTime = Date.now()
-          const resp = await http.post('/api/upload', formData, {
-            params: { path: currentPath.value || '' },
-            headers: { 'Content-Type': 'multipart/form-data' },
-            timeout: 0,
-            onUploadProgress: (e) => {
-              if (e.total > 0) {
-                uf.progress = Math.round((e.loaded / e.total) * 100)
-                const elapsed = (Date.now() - uploadStartTime) / 1000
-                if (elapsed > 0.5) {
-                  uf.speed = formatSpeed(e.loaded / elapsed)
-                }
-              }
-            },
-          })
-          const result = resp.data.data
-          if (Array.isArray(result) && result[0]?.skipped) {
-            skippedFiles.push(file.name)
-            uf.status = 'skipped'
-            continue
-          }
-          if (Array.isArray(result) && result[0]?.renamed) {
-            renamedFiles.push({ from: file.name, to: result[0].name })
-          }
-          uf.progress = 100
-          uf.status = 'success'
-        }
-      } catch {
-        uf.status = 'exception'
-      }
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(CONCURRENT, fileList.length) }, () => processNext())
-  await Promise.all(workers)
-
-  if (skippedFiles.length > 0) {
-    ElMessage.warning(`已跳过 ${skippedFiles.length} 个重复文件：${skippedFiles.join('、')}`)
-  }
-  if (renamedFiles.length > 0) {
-    const msg = renamedFiles.map(r => `${r.from} → ${r.to}`).join('、')
-    ElMessage.info(`已重命名 ${renamedFiles.length} 个文件：${msg}`)
-  }
-
-  setTimeout(() => {
-    const hasFailed = uploadingFiles.value.some(f => f.status === 'exception')
-    if (hasFailed) {
-      uploadingFiles.value = uploadingFiles.value.filter(f => f.status === 'exception')
-    } else {
-      uploadingFiles.value = []
-    }
-    loadFiles(currentPath.value)
-  }, 1500)
+  const dirPath = currentPath.value || ''
+  const entries = fileList.map(file => ({ file, dirPath, task: createUploadTask(file.name) }))
+  await runUploadQueue(entries)
+  reportUploadResults(entries.map(entry => entry.task))
+  await loadFiles(currentPath.value)
 }
 
-// 分片上传（大文件，>10MB）
+// 分片上传（大文件，>2GB）
 async function uploadFileChunked(file, dirPath, uf) {
   const CHUNK_SIZE = 5 * 1024 * 1024
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
@@ -2141,7 +2137,17 @@ async function uploadFileChunked(file, dirPath, uf) {
 
   // 2. 并发上传分片（最多3个并发）
   const CONCURRENCY = 3
-  let uploadedCount = 0
+  const chunkBytes = Array(totalChunks).fill(0)
+  let uploadedBytes = 0
+  const startedAt = Date.now()
+
+  function updateChunkProgress(index, loaded) {
+    const chunkSize = Math.min(CHUNK_SIZE, file.size - index * CHUNK_SIZE)
+    const nextBytes = Math.max(chunkBytes[index], Math.min(chunkSize, loaded))
+    uploadedBytes += nextBytes - chunkBytes[index]
+    chunkBytes[index] = nextBytes
+    updateUploadProgress(uf, uploadedBytes, file.size, startedAt)
+  }
 
   async function uploadChunk(index) {
     const start = index * CHUNK_SIZE
@@ -2155,10 +2161,14 @@ async function uploadFileChunked(file, dirPath, uf) {
     await http.post(`/api/upload/chunk/${uploadId}`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 0,
+      onUploadProgress: event => {
+        // 以实际分片字节数加权，排除 multipart 开销并累计并发分片。
+        const fraction = event.total > 0 ? event.loaded / event.total : event.loaded / chunk.size
+        updateChunkProgress(index, Math.round(chunk.size * Math.min(1, fraction)))
+      },
     })
 
-    uploadedCount++
-    uf.progress = Math.round((uploadedCount / totalChunks) * 100)
+    updateChunkProgress(index, chunk.size)
   }
 
   // Promise pool 模式控制并发
@@ -2169,6 +2179,8 @@ async function uploadFileChunked(file, dirPath, uf) {
   }
 
   // 3. 完成分片上传，合并文件
+  uf.phase = 'merging'
+  uf.speed = ''
   const completeResp = await http.post(`/api/upload/chunk/${uploadId}/complete`, null, { timeout: 0 })
   return completeResp.data.data
 }
@@ -2604,8 +2616,8 @@ onBeforeUnmount(() => {
   position: fixed;
   top: 72px;
   right: 16px;
-  width: 380px;
-  max-height: 320px;
+  width: 420px;
+  max-height: 420px;
   background: var(--fm-card-bg, #fff);
   border-radius: 10px;
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.15);
@@ -2624,32 +2636,55 @@ onBeforeUnmount(() => {
   color: var(--fm-text-primary, #303133);
 }
 .upload-toast-body {
-  max-height: 260px;
+  max-height: 340px;
   overflow-y: auto;
   padding: 8px 14px;
 }
 .upload-toast-item {
+  padding: 10px 0;
+}
+.upload-toast-item + .upload-toast-item {
+  border-top: 1px solid var(--fm-border-color, #e4e7ed);
+}
+.upload-item-heading {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  padding: 6px 0;
+  margin-bottom: 6px;
 }
 .upload-name {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
-  color: var(--fm-text-secondary, #606266);
-  max-width: 140px;
+  color: var(--fm-text-primary, #303133);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.upload-skipped-tag {
+.upload-status {
   font-size: 11px;
-  color: #e6a23c;
+  color: var(--fm-text-secondary, #606266);
   white-space: nowrap;
+}
+.upload-status.success { color: var(--el-color-success); }
+.upload-status.skipped { color: var(--el-color-warning); }
+.upload-status.exception, .upload-error { color: var(--el-color-danger); }
+.upload-summary, .upload-detail, .upload-error {
+  font-size: 11px;
+  font-weight: 400;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-summary, .upload-detail {
+  color: var(--fm-text-secondary, #606266);
 }
 .upload-speed {
   font-size: 11px;
-  color: #67c23a;
+  margin-top: 4px;
+  color: var(--fm-text-secondary, #606266);
   white-space: nowrap;
 }
 .upload-slide-enter-active, .upload-slide-leave-active {
@@ -2668,10 +2703,6 @@ html.dark .upload-toast-header {
   border-color: #3a3a3a;
   color: #e5eaf3;
 }
-html.dark .upload-speed {
-  color: #67c23a;
-}
-
 .search-hint {
   display: flex;
   align-items: center;
